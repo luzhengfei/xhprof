@@ -31,6 +31,12 @@ extern zend_module_entry xhprof_module_entry;
 #include "TSRM.h"
 #endif
 
+ZEND_BEGIN_MODULE_GLOBALS(xhprof)
+	long  xh_enable;
+ZEND_END_MODULE_GLOBALS(xhprof)
+
+#define SC_G(v) ZEND_MODULE_GLOBALS_ACCESSOR(sc, v)
+
 PHP_MINIT_FUNCTION(xhprof);
 PHP_MSHUTDOWN_FUNCTION(xhprof);
 PHP_RINIT_FUNCTION(xhprof);
