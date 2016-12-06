@@ -67,7 +67,7 @@
 # define GET_AFFINITY(pid, size, mask) sched_getaffinity(0, size, mask)
 #endif /* __FreeBSD__ */
 
-
+ZEND_DECLARE_MODULE_GLOBALS(xhprof)
 
 /**
  * **********************
@@ -116,6 +116,106 @@ typedef unsigned int uint32;
 #endif
 #if !defined(uint8)
 typedef unsigned char uint8;
+#endif
+
+#if PHP_MAJOR_VERSION >= 7
+#define XH_STR(string) ZSTR_VAL(string)
+#define XH_OP(execute_data) NULL
+#define XH_EXECUTE_FUNC(execute_data) execute_data->func
+#define Z_LVAL_PP(z) Z_LVAL_P(*z)
+#define Z_TYPE_PP(z) Z_TYPE_P(*z)
+#define Z_STRVAL_PP(z) Z_STRVAL_P(*z)
+#define xh_add_assoc_string(ht,key,str,flag) add_assoc_string(ht,key,str)
+#define FREE_ZVAL(z) z
+#define  MAKE_STD_ZVAL(z) z
+#define XH_HASH_OF(p) HASH_OF(&p)
+#define XH_ZSTR_VAL(z) ZSTR_VAL(z)
+#define XH_ADDR(z) &(z)
+#define XH_IS_ARRAY(z) (Z_TYPE_P(z)==IS_ARRAY)
+#define xh_add_assoc_zval(a,b,c) add_assoc_zval(a,b,c)
+#define xh_array_init(z) array_init(z)
+typedef zend_long xh_long;
+typedef zval xh_array;
+
+static inline int xh_zend_hash_get_current_data(HashTable *ht , void **v)
+{
+    zval *val;
+    val = zend_hash_get_current_data(ht);
+    if(val)
+    {
+        *v = (void *)val;
+        return SUCCESS;
+    }
+    return FAILURE;
+}
+
+static inline int xh_zend_hash_get_current_key_ex(const HashTable *ht, char **str_index, uint *str_length, ulong *num_index, zend_bool duplicate, HashPosition *pos)
+{
+    int ret = HASH_KEY_NON_EXISTENT;
+    zend_string *key;
+    ret = zend_hash_get_current_key_ex(ht, &key, num_index, NULL);
+    zend_string_release(key);
+    return ret;
+}
+
+static inline int xh_zend_hash_find(HashTable *ht, char *key , int key_len, void **v)
+{
+    zval *val;
+    if((val = zend_hash_str_find(ht , key ,key_len -1)) != NULL)
+    {
+        *v = (void *) val;
+        return SUCCESS;
+    }
+    return FAILURE;
+}
+#else
+#define XH_STR(string) string
+#define XH_EXECUTE_FUNC(execute_data) execute_data->function_state.function
+#define XH_OP(execute_data) execute_data->op_array
+#define XH_HASH_OF(p) HASH_OF(p)
+#define XH_ZSTR_VAL(z) z
+#define XH_ADDR(z) (z)
+#define XH_IS_ARRAY(z) (z)
+#define xh_add_assoc_string(ht,key,str,flag) add_assoc_string(ht,key,str,flag)
+#define xh_add_assoc_zval(a,b,c) add_assoc_zval(a,b,c)
+#define xh_array_init(z) do{array_init(z);}while(0)
+typedef ulong xh_long;
+typedef zval* xh_array;
+
+static inline int xh_zend_hash_get_current_data(HashTable *ht , void **v)
+{
+    zval **val = NULL;
+    if ((zend_hash_get_current_data(ht, (void**)&val) == SUCCESS))
+    {
+        *v = *val;
+        return SUCCESS;
+    }
+    else
+    {
+        *v = NULL;
+        return FAILURE;
+    }
+}
+
+static inline int xh_zend_hash_get_current_key_ex(const HashTable *ht, char **str_index, uint *str_length, ulong *num_index, zend_bool duplicate, HashPosition *pos)
+{
+    return zend_hash_get_current_key_ex(ht, str_index, str_length, num_index,duplicate , pos);
+}
+
+static inline int xh_zend_hash_find(HashTable *ht, char *key , int key_len, void **v)
+{
+    zval **val = NULL;
+    if(zend_hash_find(ht,key,key_len,(void **)&val) == SUCCESS)
+    {
+        *v = *val;
+        return SUCCESS;
+    }
+    else
+    {
+        *v = NULL;
+        return FAILURE;
+    }
+}
 #endif
 
 
@@ -174,7 +274,7 @@ typedef struct hp_global_t {
   int              ever_enabled;
 
   /* Holds all the xhprof statistics */
-  zval            *stats_count;
+  xh_array    stats_count;
 
   /* Indicates the current xhprof mode or level */
   int              profiler_level;
@@ -240,6 +340,9 @@ static ZEND_DLEXPORT void (*_zend_execute) (zend_op_array *ops TSRMLS_DC);
 /* Pointer to the origianl execute_internal function */
 static ZEND_DLEXPORT void (*_zend_execute_internal) (zend_execute_data *data,
                            int ret TSRMLS_DC);
+#elif PHP_VERSION_ID >= 70000
+ZEND_API static void (*_zend_execute_ex)(zend_execute_data *execute_data);
+ZEND_API static void (*_zend_execute_internal)(zend_execute_data *execute_data, zval *return_value);
 #else
 /* Pointer to the original execute function */
 static void (*_zend_execute_ex) (zend_execute_data *execute_data TSRMLS_DC);
@@ -358,6 +461,7 @@ PHP_INI_BEGIN()
  * directory specified by this ini setting.
  */
 PHP_INI_ENTRY("xhprof.output_dir", "", PHP_INI_ALL, NULL)
+STD_PHP_INI_ENTRY("xhprof.enable", "0", PHP_INI_ALL, OnUpdateLong, xh_enable, zend_xhprof_globals, xhprof_globals)
 
 PHP_INI_END()
 
@@ -403,7 +507,7 @@ PHP_FUNCTION(xhprof_enable) {
 PHP_FUNCTION(xhprof_disable) {
   if (hp_globals.enabled) {
     hp_stop(TSRMLS_C);
-    RETURN_ZVAL(hp_globals.stats_count, 1, 0);
+    RETURN_ZVAL(XH_ADDR(hp_globals.stats_count), 1, NULL);
   }
   /* else null is returned */
 }
@@ -431,7 +535,7 @@ PHP_FUNCTION(xhprof_sample_enable) {
 PHP_FUNCTION(xhprof_sample_disable) {
   if (hp_globals.enabled) {
     hp_stop(TSRMLS_C);
-    RETURN_ZVAL(hp_globals.stats_count, 1, 0);
+    RETURN_ZVAL(XH_ADDR(hp_globals.stats_count), 1, 0);
   }
   /* else null is returned */
 }
@@ -443,7 +547,6 @@ PHP_FUNCTION(xhprof_sample_disable) {
  */
 PHP_MINIT_FUNCTION(xhprof) {
   int i;
-
   REGISTER_INI_ENTRIES();
 
   hp_register_constants(INIT_FUNC_ARGS_PASSTHRU);
@@ -464,8 +567,9 @@ PHP_MINIT_FUNCTION(xhprof) {
   /* Initialize cpu_frequencies and cur_cpu_id. */
   hp_globals.cpu_frequencies = NULL;
   hp_globals.cur_cpu_id = 0;
-
+#if PHP_VERSION_ID < 70000
   hp_globals.stats_count = NULL;
+#endif
 
   /* no free hp_entry_t structures to start with */
   hp_globals.entry_free_list = NULL;
@@ -502,6 +606,11 @@ PHP_MSHUTDOWN_FUNCTION(xhprof) {
  * Request init callback. Nothing to do yet!
  */
 PHP_RINIT_FUNCTION(xhprof) {
+  long enable = INI_INT("xhprof.enable");
+  if(enable)
+  {
+    hp_begin(XHPROF_MODE_HIERARCHICAL, 6);
+  }
   return SUCCESS;
 }
 
@@ -662,12 +771,12 @@ void hp_init_profiler_state(int level TSRMLS_DC) {
   hp_globals.profiler_level  = (int) level;
 
   /* Init stats_count */
-  if (hp_globals.stats_count) {
-    zval_dtor(hp_globals.stats_count);
+  if (XH_IS_ARRAY(XH_ADDR(hp_globals.stats_count))) {
+    zval_dtor(XH_ADDR(hp_globals.stats_count));
     FREE_ZVAL(hp_globals.stats_count);
   }
   MAKE_STD_ZVAL(hp_globals.stats_count);
-  array_init(hp_globals.stats_count);
+  xh_array_init(XH_ADDR(hp_globals.stats_count));
 
   /* NOTE(cjiang): some fields such as cpu_frequencies take relatively longer
    * to initialize, (5 milisecond per logical cpu right now), therefore we
@@ -697,10 +806,12 @@ void hp_clean_profiler_state(TSRMLS_D) {
   hp_globals.mode_cb.exit_cb(TSRMLS_C);
 
   /* Clear globals */
-  if (hp_globals.stats_count) {
-    zval_dtor(hp_globals.stats_count);
+  if (XH_IS_ARRAY(XH_ADDR(hp_globals.stats_count))) {
+    zval_dtor(XH_ADDR(hp_globals.stats_count));
     FREE_ZVAL(hp_globals.stats_count);
+#if PHP_VERSION_ID < 70000
     hp_globals.stats_count = NULL;
+#endif
   }
   hp_globals.entries = NULL;
   hp_globals.profiler_level = 1;
@@ -932,11 +1043,16 @@ static char *hp_get_function_name(zend_op_array *ops TSRMLS_DC) {
   data = EG(current_execute_data);
 
   if (data) {
+#if PHP_MAJOR_VERSION >= 7
+    curr_func = data->func;
+    if(curr_func->common.function_name) func = ZSTR_VAL(curr_func->common.function_name);
+#else
     /* shared meta data for function on the call stack */
     curr_func = data->function_state.function;
-
     /* extract function name from the meta info */
     func = curr_func->common.function_name;
+#endif
+
 
     if (func) {
       /* previously, the order of the tests in the "if" below was
@@ -946,11 +1062,17 @@ static char *hp_get_function_name(zend_op_array *ops TSRMLS_DC) {
        * class name (not the class name based on the run-time type
        * of the object.
        */
+#if PHP_MAJOR_VERSION >= 7
       if (curr_func->common.scope) {
+        cls = ZSTR_VAL(curr_func->common.scope->name);
+      }
+#else
+     if (curr_func->common.scope) {
         cls = curr_func->common.scope->name;
       } else if (data->object) {
         cls = Z_OBJCE(*data->object)->name;
       }
+#endif
 
       if (cls) {
         len = strlen(cls) + strlen(func) + 10;
@@ -999,7 +1121,7 @@ static char *hp_get_function_name(zend_op_array *ops TSRMLS_DC) {
           add_filename = 1;
           break;
         default:
-          func = "???_op";
+          func = "main";
           break;
       }
 
@@ -1010,7 +1132,7 @@ static char *hp_get_function_name(zend_op_array *ops TSRMLS_DC) {
       if (add_filename){
         const char *filename;
         int   len;
-        filename = hp_get_base_filename((curr_func->op_array).filename);
+        filename = hp_get_base_filename(XH_STR((curr_func->op_array).filename));
         len      = strlen("run_init") + strlen(filename) + 3;
         ret      = (char *)emalloc(len);
         snprintf(ret, len, "run_init::%s", filename);
@@ -1082,16 +1204,15 @@ static void hp_fast_free_hprof_entry(hp_entry_t *p) {
  * @return void
  * @author kannan
  */
-void hp_inc_count(zval *counts, char *name, long count TSRMLS_DC) {
+void hp_inc_count(zval* counts, char *name, long count TSRMLS_DC) {
   HashTable *ht;
   void *data;
 
   if (!counts) return;
   ht = HASH_OF(counts);
-  if (!ht) return;
-
-  if (zend_hash_find(ht, name, strlen(name) + 1, &data) == SUCCESS) {
-    ZVAL_LONG(*(zval**)data, Z_LVAL_PP((zval**)data) + count);
+  if (!ht) {return;}
+  if (xh_zend_hash_find(ht, name, strlen(name) + 1, &data) == SUCCESS) {
+    ZVAL_LONG((zval*)data, Z_LVAL_P((zval*)data) + count);
   } else {
     add_assoc_long(counts, name, count);
   }
@@ -1103,6 +1224,31 @@ void hp_inc_count(zval *counts, char *name, long count TSRMLS_DC) {
  *
  * @author kannan, veeve
  */
+#if PHP_VERSION_ID >= 70000
+void hp_hash_lookup(zval *counts,char *symbol  TSRMLS_DC) {
+  HashTable   *ht;
+  void        *data;
+
+  /* Bail if something is goofy */
+  if (!XH_IS_ARRAY(XH_ADDR(hp_globals.stats_count)) || !(ht = XH_HASH_OF(hp_globals.stats_count))) {
+    counts = (zval *) 0;
+    return;
+  }
+
+  /* Lookup our hash table */
+  if (xh_zend_hash_find(ht, symbol, strlen(symbol) + 1, &data) == SUCCESS) {
+    /* Symbol already exists */
+    memcpy(counts , *(zval **)&data , sizeof(zval));
+    return;
+  }
+  else {
+    /* Add symbol to hash table */
+    MAKE_STD_ZVAL(counts);
+    xh_array_init(counts);
+    xh_add_assoc_zval(XH_ADDR(hp_globals.stats_count), symbol, counts);
+  }
+}
+#else
 zval * hp_hash_lookup(char *symbol  TSRMLS_DC) {
   HashTable   *ht;
   void        *data;
@@ -1127,6 +1273,7 @@ zval * hp_hash_lookup(char *symbol  TSRMLS_DC) {
 
   return counts;
 }
+#endif
 
 /**
  * Truncates the given timeval to the nearest slot begin, where
@@ -1175,7 +1322,7 @@ void hp_sample_stack(hp_entry_t  **entries  TSRMLS_DC) {
                         symbol,
                         sizeof(symbol));
 
-  add_assoc_string(hp_globals.stats_count,
+  xh_add_assoc_string(XH_ADDR(hp_globals.stats_count),
                    key,
                    symbol,
                    1);
@@ -1561,17 +1708,20 @@ void hp_mode_sampled_beginfn_cb(hp_entry_t **entries,
  *
  * @author kannan
  */
-zval * hp_mode_shared_endfn_cb(hp_entry_t *top,
+void hp_mode_shared_endfn_cb(zval *counts,hp_entry_t *top,
                                char          *symbol  TSRMLS_DC) {
-  zval    *counts;
   uint64   tsc_end;
 
   /* Get end tsc counter */
   tsc_end = cycle_timer();
-
   /* Get the stat array */
-  if (!(counts = hp_hash_lookup(symbol TSRMLS_CC))) {
-    return (zval *) 0;
+#if PHP_VERSION_ID>=70000
+  hp_hash_lookup(counts,symbol TSRMLS_CC);
+#else
+  counts = hp_hash_lookup(symbol TSRMLS_CC);
+#endif
+  if (!XH_IS_ARRAY(counts)) {
+    counts = (zval *) 0;return;
   }
 
   /* Bump stats in the counts hashtable */
@@ -1579,7 +1729,7 @@ zval * hp_mode_shared_endfn_cb(hp_entry_t *top,
 
   hp_inc_count(counts, "wt", get_us_from_tsc(tsc_end - top->tsc_start,
         hp_globals.cpu_frequencies[hp_globals.cur_cpu_id]) TSRMLS_CC);
-  return counts;
+  //return counts
 }
 
 /**
@@ -1589,7 +1739,7 @@ zval * hp_mode_shared_endfn_cb(hp_entry_t *top,
  */
 void hp_mode_hier_endfn_cb(hp_entry_t **entries  TSRMLS_DC) {
   hp_entry_t   *top = (*entries);
-  zval            *counts;
+  xh_array counts;
   struct rusage    ru_end;
   char             symbol[SCRATCH_BUF_LEN];
   long int         mu_end;
@@ -1597,8 +1747,8 @@ void hp_mode_hier_endfn_cb(hp_entry_t **entries  TSRMLS_DC) {
 
   /* Get the stat array */
   hp_get_function_stack(top, 2, symbol, sizeof(symbol));
-  if (!(counts = hp_mode_shared_endfn_cb(top,
-                                         symbol  TSRMLS_CC))) {
+  hp_mode_shared_endfn_cb(XH_ADDR(counts),top,symbol  TSRMLS_CC);
+  if (!XH_IS_ARRAY(XH_ADDR(counts))) {
     return;
   }
 
@@ -1607,21 +1757,21 @@ void hp_mode_hier_endfn_cb(hp_entry_t **entries  TSRMLS_DC) {
     getrusage(RUSAGE_SELF, &ru_end);
 
     /* Bump CPU stats in the counts hashtable */
-    hp_inc_count(counts, "cpu", (get_us_interval(&(top->ru_start_hprof.ru_utime),
+    hp_inc_count(XH_ADDR(counts), "cpu", (get_us_interval(&(top->ru_start_hprof.ru_utime),
                                               &(ru_end.ru_utime)) +
                               get_us_interval(&(top->ru_start_hprof.ru_stime),
                                               &(ru_end.ru_stime)))
               TSRMLS_CC);
   }
-
+//
   if (hp_globals.xhprof_flags & XHPROF_FLAGS_MEMORY) {
     /* Get Memory usage */
     mu_end  = zend_memory_usage(0 TSRMLS_CC);
     pmu_end = zend_memory_peak_usage(0 TSRMLS_CC);
 
     /* Bump Memory stats in the counts hashtable */
-    hp_inc_count(counts, "mu",  mu_end - top->mu_start_hprof    TSRMLS_CC);
-    hp_inc_count(counts, "pmu", pmu_end - top->pmu_start_hprof  TSRMLS_CC);
+    hp_inc_count(XH_ADDR(counts), "mu",  mu_end - top->mu_start_hprof    TSRMLS_CC);
+    hp_inc_count(XH_ADDR(counts), "pmu", pmu_end - top->pmu_start_hprof  TSRMLS_CC);
   }
 }
 
@@ -1651,17 +1801,22 @@ void hp_mode_sampled_endfn_cb(hp_entry_t **entries  TSRMLS_DC) {
  */
 #if PHP_VERSION_ID < 50500
 ZEND_DLEXPORT void hp_execute (zend_op_array *ops TSRMLS_DC) {
+#elif PHP_VERSION_ID >= 70000
+void hp_execute_ex (zend_execute_data *execute_data) {
+zend_op_array *ops = XH_OP(execute_data);
 #else
 ZEND_DLEXPORT void hp_execute_ex (zend_execute_data *execute_data TSRMLS_DC) {
-  zend_op_array *ops = execute_data->op_array;
+  zend_op_array *ops = XH_OP(execute_data);
 #endif
   char          *func = NULL;
   int hp_profile_flag = 1;
-
   func = hp_get_function_name(ops TSRMLS_CC);
+
   if (!func) {
 #if PHP_VERSION_ID < 50500
     _zend_execute(ops TSRMLS_CC);
+#elif PHP_VERSION_ID >= 70000
+     _zend_execute_ex(execute_data);
 #else
     _zend_execute_ex(execute_data TSRMLS_CC);
 #endif
@@ -1695,6 +1850,8 @@ ZEND_DLEXPORT void hp_execute_ex (zend_execute_data *execute_data TSRMLS_DC) {
 
 ZEND_DLEXPORT void hp_execute_internal(zend_execute_data *execute_data,
                                        int ret TSRMLS_DC) {
+#elif PHP_VERSION_ID >= 70000
+ZEND_API static void hp_execute_internal(zend_execute_data *execute_data, zval *return_value) {
 #else
 #define EX_T(offset) (*EX_TMP_VAR(execute_data, offset))
 
@@ -1704,9 +1861,8 @@ ZEND_DLEXPORT void hp_execute_internal(zend_execute_data *execute_data,
   zend_execute_data *current_data;
   char             *func = NULL;
   int    hp_profile_flag = 1;
-
   current_data = EG(current_execute_data);
-  func = hp_get_function_name(current_data->op_array TSRMLS_CC);
+  func = hp_get_function_name(XH_OP(current_data) TSRMLS_CC);
 
   if (func) {
     BEGIN_PROFILING(&hp_globals.entries, func, hp_profile_flag);
@@ -1714,12 +1870,12 @@ ZEND_DLEXPORT void hp_execute_internal(zend_execute_data *execute_data,
 
   if (!_zend_execute_internal) {
     /* no old override to begin with. so invoke the builtin's implementation  */
-
-#if ZEND_EXTENSION_API_NO >= 220121212
+#if PHP_VERSION_ID >= 70000
+	execute_data->func->internal_function.handler(execute_data, return_value);
+#elif ZEND_EXTENSION_API_NO >= 220121212
     /* PHP 5.5. This is just inlining a copy of execute_internal(). */
-
     if (fci != NULL) {
-      ((zend_internal_function *) execute_data->function_state.function)->handler(
+      ((zend_internal_function *) XH_EXECUTE_FUNC(execute_data))->handler(
         fci->param_count,
         *fci->retval_ptr_ptr,
         fci->retval_ptr_ptr,
@@ -1758,6 +1914,8 @@ ZEND_DLEXPORT void hp_execute_internal(zend_execute_data *execute_data,
     /* call the old override */
 #if PHP_VERSION_ID < 50500
     _zend_execute_internal(execute_data, ret TSRMLS_CC);
+#elif PHP_VERSION_ID >= 70000
+    _zend_execute_internal(execute_data , return_value);
 #else
     _zend_execute_internal(execute_data, fci, ret TSRMLS_CC);
 #endif
@@ -1777,7 +1935,7 @@ ZEND_DLEXPORT void hp_execute_internal(zend_execute_data *execute_data,
  *
  * @author kannan, hzhao
  */
-ZEND_DLEXPORT zend_op_array* hp_compile_file(zend_file_handle *file_handle,
+ZEND_API zend_op_array* hp_compile_file(zend_file_handle *file_handle,
                                              int type TSRMLS_DC) {
 
   const char     *filename;
@@ -1868,7 +2026,6 @@ static void hp_begin(long level, long xhprof_flags TSRMLS_DC) {
        */
       zend_execute_internal = hp_execute_internal;
     }
-
     /* Initialize with the dummy mode first Having these dummy callbacks saves
      * us from checking if any of the callbacks are NULL everywhere. */
     hp_globals.mode_cb.init_cb     = hp_mode_dummy_init_cb;
@@ -1937,7 +2094,6 @@ static void hp_stop(TSRMLS_D) {
   zend_execute_internal = _zend_execute_internal;
   zend_compile_file     = _zend_compile_file;
   zend_compile_string   = _zend_compile_string;
-
   /* Resore cpu affinity. */
   restore_cpu_affinity(&hp_globals.prev_mask);
 
@@ -1961,13 +2117,13 @@ static zval *hp_zval_at_key(char  *key,
                             zval  *values) {
   zval *result = NULL;
 
-  if (values->type == IS_ARRAY) {
+  if (Z_TYPE_P(values) == IS_ARRAY) {
     HashTable *ht;
     zval     **value;
     uint       len = strlen(key) + 1;
 
     ht = Z_ARRVAL_P(values);
-    if (zend_hash_find(ht, key, len, (void**)&value) == SUCCESS) {
+    if (xh_zend_hash_find(ht, key, len, (void**)&value) == SUCCESS) {
       result = *value;
     }
   } else {
@@ -1991,7 +2147,7 @@ static char **hp_strings_in_zval(zval  *values) {
     return NULL;
   }
 
-  if (values->type == IS_ARRAY) {
+  if (Z_TYPE_P(values) == IS_ARRAY) {
     HashTable *ht;
 
     ht    = Z_ARRVAL_P(values);
@@ -2011,10 +2167,10 @@ static char **hp_strings_in_zval(zval  *values) {
       int    type;
       zval **data;
 
-      type = zend_hash_get_current_key_ex(ht, &str, &len, &idx, 0, NULL);
+      type = xh_zend_hash_get_current_key_ex(ht, &str, &len, &idx, 0, NULL);
       /* Get the names stored in a standard array */
       if(type == HASH_KEY_IS_LONG) {
-        if ((zend_hash_get_current_data(ht, (void**)&data) == SUCCESS) &&
+        if ((xh_zend_hash_get_current_data(ht, (void**)&data) == SUCCESS) &&
             Z_TYPE_PP(data) == IS_STRING &&
             strcmp(Z_STRVAL_PP(data), ROOT_SYMBOL)) { /* do not ignore "main" */
           result[ix] = estrdup(Z_STRVAL_PP(data));
@@ -2022,7 +2178,7 @@ static char **hp_strings_in_zval(zval  *values) {
         }
       }
     }
-  } else if(values->type == IS_STRING) {
+  } else if(Z_TYPE_P(values) == IS_STRING) {
     if((result = (char**)emalloc(sizeof(char*) * 2)) == NULL) {
       return result;
     }
