@@ -1708,8 +1708,11 @@ void hp_mode_sampled_beginfn_cb(hp_entry_t **entries,
  *
  * @author kannan
  */
-void hp_mode_shared_endfn_cb(zval *counts,hp_entry_t *top,
-                               char          *symbol  TSRMLS_DC) {
+#if PHP_VERSION_ID>=70000
+void hp_mode_shared_endfn_cb(zval *counts,hp_entry_t *top,char *symbol  TSRMLS_DC) {
+#else
+zval* hp_mode_shared_endfn_cb(hp_entry_t *top,char *symbol  TSRMLS_DC) {
+#endif
   uint64   tsc_end;
 
   /* Get end tsc counter */
@@ -1718,6 +1721,7 @@ void hp_mode_shared_endfn_cb(zval *counts,hp_entry_t *top,
 #if PHP_VERSION_ID>=70000
   hp_hash_lookup(counts,symbol TSRMLS_CC);
 #else
+  zval    *counts;
   counts = hp_hash_lookup(symbol TSRMLS_CC);
 #endif
   if (!XH_IS_ARRAY(counts)) {
@@ -1729,7 +1733,9 @@ void hp_mode_shared_endfn_cb(zval *counts,hp_entry_t *top,
 
   hp_inc_count(counts, "wt", get_us_from_tsc(tsc_end - top->tsc_start,
         hp_globals.cpu_frequencies[hp_globals.cur_cpu_id]) TSRMLS_CC);
-  //return counts
+#if PHP_VERSION_ID<70000
+  return counts;
+#endif
 }
 
 /**
@@ -1747,7 +1753,11 @@ void hp_mode_hier_endfn_cb(hp_entry_t **entries  TSRMLS_DC) {
 
   /* Get the stat array */
   hp_get_function_stack(top, 2, symbol, sizeof(symbol));
+#if PHP_VERSION_ID >=70000
   hp_mode_shared_endfn_cb(XH_ADDR(counts),top,symbol  TSRMLS_CC);
+#else
+  counts = hp_mode_shared_endfn_cb(top,symbol  TSRMLS_CC);
+#endif
   if (!XH_IS_ARRAY(XH_ADDR(counts))) {
     return;
   }
